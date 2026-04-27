@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import Image from "next/image";
 
 import { useTheme } from "@/providers/ThemeProvider";
 import { ThemeMap } from "../types/theme-types";
@@ -64,6 +65,11 @@ export default function HomePage() {
       >
         {mode === "dark" ? "Light Mode" : "Dark Mode"}
       </button>
+
+      {/* Logo */}
+      <div style={{ marginBottom: "40px" }}>
+        <Image src="/skema-logo.png" alt="Skema Logo" width={120} height={120} priority />
+      </div>
 
       {/* Hero */}
       <section style={{ textAlign: "center", maxWidth: "720px" }}>

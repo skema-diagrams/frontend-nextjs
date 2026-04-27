@@ -18,12 +18,10 @@
         "name": "next"
       }
     ],
-    "baseUrl": "src/",
-    "ignoreDeprecations": "6.0",
     "paths": {
-      "@/components/*": ["components/*"],
-      "@/lib/*": ["lib/*"],
-      "@/providers/*": ["providers/*"],
+      "@/components/*": ["./src/components/*"],
+      "@/lib/*": ["./src/lib/*"],
+      "@/providers/*": ["./src/providers/*"],
       "@/*": ["./src/*"]
     }
   },

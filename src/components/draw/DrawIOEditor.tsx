@@ -1,18 +1,17 @@
 "use client";
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useTheme } from "@/providers/ThemeProvider";
 import Link from "next/link";
 
-type DrawIOEvent = "configure" | "init" | "save" | "autosave" | "exit" | "load" | "export";
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 interface DrawIOMessage {
-  event?: DrawIOEvent;
+  event?: "configure" | "init" | "save" | "autosave" | "exit" | "load" | "export";
   xml?: string;
   data?: string;
   format?: string;
   exit?: boolean;
-  modified?: boolean;
 }
 
 interface DrawIOEditorProps {
@@ -22,6 +21,8 @@ interface DrawIOEditorProps {
   onExit?: () => void;
   className?: string;
 }
+
+// ─── Constants ────────────────────────────────────────────────────────────────
 
 const DEFAULT_XML = `
 <mxfile host="app.diagrams.net">
@@ -39,6 +40,35 @@ const DEFAULT_XML = `
 </mxfile>
 `;
 
+const LOAD_TIMEOUT_MS = 10_000;
+const REINIT_DELAY_MS = 50;
+
+const LOAD_PAYLOAD = {
+  action: "load",
+  autosave: 1,
+  title: "Untitled Diagram",
+  saveAndExit: 1,
+  noExitBtn: 0,
+  noSaveBtn: 0,
+  rough: 0,
+  libs: ["general", "uml", "er", "flowchart", "aws4", "bpmn"],
+} as const;
+
+const CONFIGURE_PAYLOAD = {
+  action: "configure",
+  config: {
+    defaultFonts: ["Inter"],
+    defaultVertexStyle: { rounded: 1, arcSize: 12 },
+  },
+} as const;
+
+const BUTTON_CLASS =
+  "rounded-lg border px-4 py-2 text-sm transition-colors " +
+  "border-[#D0D5DD] bg-white text-[#101828] hover:bg-neutral-100 " +
+  "dark:border-[#2A2D31] dark:bg-[#141518] dark:text-[#F5F5F5] dark:hover:bg-[#1D2025]";
+
+// ─── Component ────────────────────────────────────────────────────────────────
+
 export default function DrawIOEditor({
   initialXml = DEFAULT_XML,
   onSave,
@@ -46,134 +76,112 @@ export default function DrawIOEditor({
   onExit,
   className,
 }: DrawIOEditorProps) {
-  const iframeRef = useRef<HTMLIFrameElement | null>(null);
-
-  const [xml, setXml] = useState(initialXml);
-  const [isReady, setIsReady] = useState(false);
-
   const { mode, toggleTheme } = useTheme();
+
+  // ── Refs ──────────────────────────────────────────────────────────────────
+  const iframeRef     = useRef<HTMLIFrameElement>(null);
+  const isMountedRef  = useRef(true);
+  const loadTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const xmlRef        = useRef(initialXml);
+  const onSaveRef     = useRef(onSave);
+  const onAutosaveRef = useRef(onAutosave);
+  const onExitRef     = useRef(onExit);
+
+  // Keep callback refs fresh without causing re-renders
+  useEffect(() => { onSaveRef.current     = onSave;     }, [onSave]);
+  useEffect(() => { onAutosaveRef.current = onAutosave; }, [onAutosave]);
+  useEffect(() => { onExitRef.current     = onExit;     }, [onExit]);
+
+  // ── State ─────────────────────────────────────────────────────────────────
+  const [isReady,       setIsReady]       = useState(false);
+  const [loadError,     setLoadError]     = useState(false);
   const [isTransitioning, setIsTransitioning] = useState(false);
 
-  /**
-   * Official Embed Mode URL
-   * Docs:
-   * https://www.drawio.com/doc/faq/embed-mode
-   */
+  // ── Derived URL ───────────────────────────────────────────────────────────
   const drawioUrl = useMemo(() => {
     const url = new URL("https://embed.diagrams.net/");
-
-    url.searchParams.set("embed", "1");
-    url.searchParams.set("proto", "json");
-    url.searchParams.set("spin", "1");
-
+    url.searchParams.set("embed",     "1");
+    url.searchParams.set("proto",     "json");
+    url.searchParams.set("spin",      "1");
     url.searchParams.set("configure", "1");
     url.searchParams.set("libraries", "1");
-
-    // 👇 dynamic theme
-    if (mode === "dark") {
-      url.searchParams.set("dark", "1");
-      url.searchParams.set("ui", "dark");
-    } else {
-      url.searchParams.set("dark", "0");
-      url.searchParams.set("ui", "min");
-    }
-
+    url.searchParams.set("dark", mode === "dark" ? "1" : "0");
+    url.searchParams.set("ui",   mode === "dark" ? "dark" : "min");
     return url.toString();
   }, [mode]);
 
-  /**
-   * Send message to draw.io iframe
-   */
-  const postMessage = useCallback((message: unknown) => {
-    if (!iframeRef.current?.contentWindow) return;
+  // Keep URL ref in sync for use inside layout effect
+  const drawioUrlRef = useRef(drawioUrl);
+  useEffect(() => { drawioUrlRef.current = drawioUrl; }, [drawioUrl]);
 
-    iframeRef.current.contentWindow.postMessage(JSON.stringify(message), "*");
+  // ── Helpers ───────────────────────────────────────────────────────────────
+  const postToFrame = useCallback((message: object) => {
+    iframeRef.current?.contentWindow?.postMessage(JSON.stringify(message), "*");
   }, []);
 
-  /**
-   * Initial load
-   */
-  const loadDiagram = useCallback(() => {
-    postMessage({
-      action: "load",
-      autosave: 1,
-      xml,
+  const clearLoadTimeout = useCallback(() => {
+    if (loadTimeoutRef.current) {
+      clearTimeout(loadTimeoutRef.current);
+      loadTimeoutRef.current = null;
+    }
+  }, []);
 
-      // UI
-      title: "Untitled Diagram",
-      saveAndExit: 1,
-      noExitBtn: 0,
-      noSaveBtn: 0,
+  // ── Public actions ────────────────────────────────────────────────────────
+  const requestSave = useCallback(() => postToFrame({ action: "save" }), [postToFrame]);
 
-      // Theme
-      // dark: 0,
-      // theme: "kennedy",
+  const exportPNG = useCallback(() =>
+    postToFrame({ action: "export", format: "png", spin: "Exporting...", transparent: false, currentPage: true, scale: 2 }),
+  [postToFrame]);
 
-      // Sketch mode
-      rough: 0,
+  const exportSVG = useCallback(() =>
+    postToFrame({ action: "export", format: "svg", currentPage: true }),
+  [postToFrame]);
 
-      // Shape libraries
-      libs: ["general", "uml", "er", "flowchart", "aws4", "bpmn"],
-    });
-  }, [postMessage, xml]);
-
-  /**
-   * Save current diagram manually
-   */
-  const requestSave = useCallback(() => {
-    postMessage({
-      action: "save",
-    });
-  }, [postMessage]);
-
-  /**
-   * Export PNG
-   */
-  const exportPNG = useCallback(() => {
-    postMessage({
-      action: "export",
-      format: "png",
-      spin: "Exporting...",
-      transparent: false,
-      currentPage: true,
-      scale: 2,
-    });
-  }, [postMessage]);
-
-  /**
-   * Export SVG
-   */
-  const exportSVG = useCallback(() => {
-    postMessage({
-      action: "export",
-      format: "svg",
-      currentPage: true,
-    });
-  }, [postMessage]);
-
-  useEffect(() => {
+  // ── iframe onLoad ─────────────────────────────────────────────────────────
+  const handleIframeLoad = useCallback(() => {
+    if (!isMountedRef.current) return;
+    setLoadError(false);
     setIsReady(false);
+    clearLoadTimeout();
+
+    loadTimeoutRef.current = setTimeout(() => {
+      if (!isMountedRef.current) return;
+      setIsReady((ready) => {
+        if (!ready) {
+          console.error("diagrams.net failed to initialize within 10 s");
+          setLoadError(true);
+        }
+        return ready;
+      });
+    }, LOAD_TIMEOUT_MS);
+  }, [clearLoadTimeout]);
+
+  // ── Retry ─────────────────────────────────────────────────────────────────
+  const retryLoad = useCallback(() => {
+    setLoadError(false);
+    setIsReady(false);
+    const iframe = iframeRef.current;
+    if (!iframe) return;
+    const src = iframe.src;
+    iframe.src = "";
+    setTimeout(() => { if (iframeRef.current) iframeRef.current.src = src; }, 100);
+  }, []);
+
+  // ── Theme transition overlay ──────────────────────────────────────────────
+  useEffect(() => {
+    setIsTransitioning(true);
+    const t = setTimeout(() => setIsTransitioning(false), 300);
+    return () => clearTimeout(t);
   }, [mode]);
 
-  // useEffect(() => {
-  //   // After theme changes (iframe src changes),
-  //   // immediately collapse the history entry
-  //   const timeout = setTimeout(() => {
-  //     window.history.replaceState(null, "", window.location.href);
-  //   }, 0);
+  // ── Core message handler + iframe reinit on navigation ───────────────────
+  useLayoutEffect(() => {
+    isMountedRef.current = true;
 
-  //   return () => clearTimeout(timeout);
-  // }, [drawioUrl]);
-
-  /**
-   * Handle iframe messages
-   */
-  useEffect(() => {
-    const handleMessage = (event: MessageEvent) => {
-      if (!event.data) return;
+    const onMessage = (event: MessageEvent) => {
+      if (!isMountedRef.current || !event.data) return;
 
       let msg: DrawIOMessage;
-
       try {
         msg = typeof event.data === "string" ? JSON.parse(event.data) : event.data;
       } catch {
@@ -181,195 +189,134 @@ export default function DrawIOEditor({
       }
 
       switch (msg.event) {
-        /**
-         * configure=1
-         * draw.io waits for configuration before init
-         */
         case "configure":
-          postMessage({
-            action: "configure",
-            config: {
-              defaultFonts: ["Inter"],
-              defaultVertexStyle: {
-                rounded: 1,
-                arcSize: 12,
-              },
-            },
-          });
+          postToFrame(CONFIGURE_PAYLOAD);
           break;
 
-        /**
-         * Editor ready
-         */
         case "init":
           setIsReady(true);
-          loadDiagram();
+          clearLoadTimeout();
+          postToFrame({ ...LOAD_PAYLOAD, xml: xmlRef.current });
           break;
 
-        /**
-         * Initial diagram loaded
-         */
-        case "load":
-          console.log("Diagram loaded");
-          break;
-
-        /**
-         * Autosave event
-         */
         case "autosave":
           if (msg.xml) {
-            setXml(msg.xml);
-            onAutosave?.(msg.xml);
+            xmlRef.current = msg.xml;
+            onAutosaveRef.current?.(msg.xml);
           }
           break;
 
-        /**
-         * Manual save
-         */
         case "save":
           if (msg.xml) {
-            setXml(msg.xml);
-            onSave?.(msg.xml);
-
-            console.log("Saved XML:", msg.xml);
+            xmlRef.current = msg.xml;
+            onSaveRef.current?.(msg.xml);
           }
-
-          if (msg.exit) {
-            onExit?.();
-          }
-
+          if (msg.exit) onExitRef.current?.();
           break;
 
-        /**
-         * Export result
-         */
-        case "export":
+        case "export": {
           if (!msg.data) return;
-
-          // Download exported file
-          const link = document.createElement("a");
-
-          link.href = msg.data;
-
-          link.download = msg.format === "svg" ? "diagram.svg" : "diagram.png";
-
-          document.body.appendChild(link);
-          link.click();
-          document.body.removeChild(link);
-
+          const a = document.createElement("a");
+          a.href = msg.data;
+          a.download = msg.format === "svg" ? "diagram.svg" : "diagram.png";
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
           break;
+        }
 
-        /**
-         * Exit editor
-         */
         case "exit":
-          onExit?.();
-          break;
-
-        default:
+          onExitRef.current?.();
           break;
       }
     };
 
-    window.addEventListener("message", handleMessage);
+    window.addEventListener("message", onMessage);
+
+    // Reinitialize the iframe on every real mount.
+    // The 50 ms timer distinguishes a real mount from StrictMode's fake
+    // unmount+remount (which happens synchronously and cancels the timer).
+    const reinitTimer = setTimeout(() => {
+      if (!isMountedRef.current || !iframeRef.current) return;
+      iframeRef.current.src = drawioUrlRef.current;
+    }, REINIT_DELAY_MS);
 
     return () => {
-      window.removeEventListener("message", handleMessage);
+      isMountedRef.current = false;
+      clearTimeout(reinitTimer);
+      clearLoadTimeout();
+      window.removeEventListener("message", onMessage);
     };
-  }, [loadDiagram, onAutosave, onExit, onSave, postMessage]);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  useEffect(() => {
-    setIsTransitioning(true);
-
-    const timeout = setTimeout(() => {
-      setIsTransitioning(false);
-    }, 300); // match CSS duration
-
-    return () => clearTimeout(timeout);
-  }, [mode]);
-
-  const buttonClass =
-    "rounded-lg border px-4 py-2 text-sm transition-colors " +
-    "border-[#D0D5DD] bg-white text-[#101828] hover:bg-neutral-100 " +
-    "dark:border-[#2A2D31] dark:bg-[#141518] dark:text-[#F5F5F5] dark:hover:bg-[#1D2025]";
+  // ── Render ────────────────────────────────────────────────────────────────
+  const isDark = mode === "dark";
 
   return (
     <div className={className ?? "flex h-screen w-full flex-col bg-neutral-100"}>
-      {/* Top Toolbar */}
-      <div
-        className={`flex items-center justify-between border-b px-4 py-3 transition-colors duration-300 ${
-          mode === "dark" ? "bg-[#101113] border-[#2A2D31]" : "bg-white border-[#E4E7EC]"
-        }`}
-      >
-        <Link href="/">
-          <button className={buttonClass}>HOME</button>
-        </Link>
 
-        {/* TITLE SECTION */}
+      {/* Toolbar */}
+      <div className={`flex items-center justify-between border-b px-4 py-3 transition-colors duration-300 ${
+        isDark ? "bg-[#101113] border-[#2A2D31]" : "bg-white border-[#E4E7EC]"
+      }`}>
+        <Link href="/"><button className={BUTTON_CLASS}>HOME</button></Link>
+
         <div>
-          <h1 className={`text-sm font-semibold ${mode === "dark" ? "text-[#F5F5F5]" : "text-[#111827]"}`}>
+          <h1 className={`text-sm font-semibold ${isDark ? "text-[#F5F5F5]" : "text-[#111827]"}`}>
             Draw.io Embedded Editor
           </h1>
-
-          <p className={`text-xs ${mode === "dark" ? "text-[#A0A7B4]" : "text-neutral-500"}`}>
+          <p className={`text-xs ${isDark ? "text-[#A0A7B4]" : "text-neutral-500"}`}>
             diagrams.net Embed Mode + postMessage API
           </p>
         </div>
 
-        {/* RIGHT BUTTONS */}
         <div className="flex items-center gap-2">
-          <button onClick={requestSave} className={buttonClass}>
-            Save
-          </button>
-
-          <button onClick={exportPNG} className={buttonClass}>
-            Export PNG
-          </button>
-
-          <button onClick={exportSVG} className={buttonClass}>
-            Export SVG
-          </button>
-
-          <button onClick={toggleTheme} className={buttonClass}>
-            {mode === "dark" ? "Light Mode" : "Dark Mode"}
+          <button onClick={requestSave}  className={BUTTON_CLASS}>Save</button>
+          <button onClick={exportPNG}    className={BUTTON_CLASS}>Export PNG</button>
+          <button onClick={exportSVG}    className={BUTTON_CLASS}>Export SVG</button>
+          <button onClick={toggleTheme}  className={BUTTON_CLASS}>
+            {isDark ? "Light Mode" : "Dark Mode"}
           </button>
         </div>
       </div>
 
-      {/* Editor */}
-      {/* <div className="relative flex-1 overflow-hidden">
-        {!isReady && (
-          <div className="absolute inset-0 z-10 flex items-center justify-center bg-white">
-            <div className="text-sm text-neutral-500">Loading diagrams.net...</div>
+      {/* Editor area */}
+      <div className="relative flex-1 overflow-hidden">
+
+        {/* Theme-change fade overlay */}
+        <div className={`pointer-events-none absolute inset-0 z-20 transition-opacity duration-300 ${
+          isTransitioning
+            ? isDark ? "bg-[#0E0F12] opacity-100" : "bg-white opacity-100"
+            : "opacity-0"
+        }`} />
+
+        {/* Loading state */}
+        {!isReady && !loadError && (
+          <div className="absolute inset-0 z-10 flex items-center justify-center bg-white dark:bg-[#0E0F12]">
+            <div className="flex flex-col items-center gap-3">
+              <p className="text-sm text-neutral-500 dark:text-neutral-400">Loading diagrams.net...</p>
+              <div className="h-1 w-48 overflow-hidden rounded-full bg-neutral-200 dark:bg-neutral-700">
+                <div className="h-full w-1/2 animate-pulse bg-blue-500" />
+              </div>
+            </div>
           </div>
         )}
 
-        <iframe ref={iframeRef} title="drawio-editor" src={drawioUrl} className="h-full w-full border-0" />
-      </div> */}
-
-      <div className="relative flex-1 overflow-hidden">
-        {/* FADE OVERLAY */}
-        <div
-          className={`pointer-events-none absolute inset-0 z-20 transition-opacity duration-300 ${
-            isTransitioning
-              ? mode === "dark"
-                ? "bg-[#0E0F12] opacity-100"
-                : "bg-white opacity-100"
-              : "opacity-0"
-          }`}
-        />
-
-        {!isReady && (
+        {/* Error state */}
+        {loadError && (
           <div className="absolute inset-0 z-10 flex items-center justify-center bg-white dark:bg-[#0E0F12]">
-            <div className="text-sm text-neutral-500">Loading diagrams.net...</div>
+            <div className="flex flex-col items-center gap-4">
+              <p className="text-sm text-red-500">Failed to load diagrams.net editor</p>
+              <button onClick={retryLoad} className={BUTTON_CLASS}>Retry</button>
+            </div>
           </div>
         )}
 
         <iframe
-          key={`${mode}-${drawioUrl}`} // 🔥 force remount
           ref={iframeRef}
           title="drawio-editor"
           src={drawioUrl}
+          onLoad={handleIframeLoad}
           className="h-full w-full border-0"
         />
       </div>
